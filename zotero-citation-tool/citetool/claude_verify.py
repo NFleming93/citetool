@@ -19,6 +19,7 @@ so subscription mode strips it from the subprocess environment.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -117,12 +118,13 @@ def parse_response(text: str, model: str) -> VerifiedItem:
 
 
 def _clean_env(auth_mode: str, api_key: str) -> dict:
-    env = dict(os.environ)
+    # NOTE: the SDK MERGES this over the inherited environment (verified in
+    # subprocess_cli.py), so deleting keys from a copy does nothing — an
+    # empty-string override is how you neutralise a stray API key that would
+    # otherwise shadow the subscription sign-in.
     if auth_mode == "subscription":
-        env.pop("ANTHROPIC_API_KEY", None)   # would shadow the sign-in
-    else:
-        env["ANTHROPIC_API_KEY"] = api_key
-    return env
+        return {"ANTHROPIC_API_KEY": ""}
+    return {"ANTHROPIC_API_KEY": api_key}
 
 
 class ClaudeVerifier:
@@ -139,20 +141,30 @@ class ClaudeVerifier:
         import anyio
         from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
 
+        # No max_turns cap: with no tools there is exactly one reply anyway,
+        # and the cap made some CLI versions mark the finished run as an error
+        # ("error result: success") and exit non-zero.
         options = ClaudeAgentOptions(
             model=self.model,
-            max_turns=1,
             allowed_tools=[],          # page already fetched; pure judgement call
             env=_clean_env(self.auth_mode, self.api_key),
         )
 
         async def run() -> str:
             parts: list[str] = []
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            parts.append(block.text)
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                parts.append(block.text)
+            except Exception:
+                # If Claude's reply already arrived, a tantrum from the helper
+                # process while shutting down doesn't invalidate it.
+                if not parts:
+                    raise
+                logging.getLogger("citetool").debug(
+                    "ignored post-reply SDK error", exc_info=True)
             return "".join(parts)
 
         return anyio.run(run)
