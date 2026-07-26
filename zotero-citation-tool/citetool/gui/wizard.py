@@ -53,11 +53,19 @@ class ClaudePage(QWizardPage):
         self.btn_signin = QPushButton("Sign in with Claude…")
         self.btn_signin.clicked.connect(self._launch_signin)
         sub_row.addWidget(self.btn_signin)
-        sub_hint = QLabel("A small window will open and your browser will ask you "
-                          "to approve the sign-in. Come back here afterwards.")
+        sub_hint = QLabel("A black window opens and your browser asks you to "
+                          "approve. At the end, the black window shows a long "
+                          "code starting with sk-ant-.")
         sub_hint.setWordWrap(True); sub_hint.setStyleSheet(GREY)
         sub_row.addWidget(sub_hint, 1)
         lay.addLayout(sub_row)
+
+        lay.addWidget(QLabel("Copy that code (drag the mouse across it, then "
+                             "press Enter) and paste it here:"))
+        self.token_edit = QLineEdit()
+        self.token_edit.setEchoMode(QLineEdit.Password)
+        self.token_edit.setPlaceholderText("sk-ant-…  (from the black window)")
+        lay.addWidget(self.token_edit)
 
         lay.addSpacing(12)
         lay.addWidget(self.rb_key)
@@ -86,13 +94,16 @@ class ClaudePage(QWizardPage):
             return
         try:
             if sys.platform == "win32":
-                subprocess.Popen(["cmd", "/c", "start", "Claude sign-in", cli,
-                                  "setup-token"], shell=False)
+                # cmd /k keeps the window open afterwards so the code it
+                # prints stays on screen for copying.
+                subprocess.Popen(["cmd", "/c", "start", "Claude sign-in",
+                                  "cmd", "/k", cli, "setup-token"], shell=False)
             else:
                 subprocess.Popen(["x-terminal-emulator", "-e", cli, "setup-token"])
             self.status.setStyleSheet(GREY)
-            self.status.setText("Finish the sign-in in the window that opened, "
-                                "then press 'Check connection'.")
+            self.status.setText("Approve the sign-in in your browser, then copy "
+                                "the long sk-ant-… code from the black window "
+                                "into the box below.")
         except Exception as e:
             self.status.setStyleSheet(RED)
             self.status.setText(f"Couldn't open the sign-in window: {e}")
@@ -104,6 +115,8 @@ class ClaudePage(QWizardPage):
         self.btn_check.setEnabled(False)
         self.status.setStyleSheet(GREY)
         self.status.setText("Checking — this takes a few seconds…")
+        self.cfg["claude_oauth_token"] = self.token_edit.text().strip()
+        config.save(self.cfg)   # the verifier reads the code from config
         verifier = ClaudeVerifier(model="haiku", auth_mode=self._mode(),
                                   api_key=self.key_edit.text().strip())
         self._worker = FunctionWorker(verifier.check_auth)
@@ -122,8 +135,13 @@ class ClaudePage(QWizardPage):
             self.cfg["anthropic_api_key"] = self.key_edit.text().strip()
         else:
             self.status.setStyleSheet(RED)
-            self.status.setText("✗ Not connected yet. If you just signed in, wait a "
-                                f"moment and try again. Detail: {detail}")
+            if "not logged in" in detail.lower():
+                self.status.setText("✗ The sign-in code hasn't reached the app — "
+                                    "paste the long sk-ant-… code from the black "
+                                    "window into the box above, then check again.")
+            else:
+                self.status.setText("✗ Not connected yet. If you just signed in, wait a "
+                                    f"moment and try again. Detail: {detail}")
         self.completeChanged.emit()
 
     def isComplete(self) -> bool:
