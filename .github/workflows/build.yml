@@ -1,5 +1,5 @@
-# Builds CiteTool for Windows in GitHub's cloud. Trigger it from the
-# Actions tab ("Run workflow") or just by uploading/changing any file.
+# Builds CiteTool for Windows in GitHub's cloud. This version finds the
+# project files automatically, even if they were uploaded inside a subfolder.
 name: Build Windows app
 
 on:
@@ -11,23 +11,46 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Find the project files
+        run: |
+          $req = Get-ChildItem -Recurse -Depth 4 -Filter requirements.txt | Select-Object -First 1
+          if (-not $req) {
+            Write-Host "PROBLEM: requirements.txt was not found anywhere in this repository."
+            Write-Host "Here is everything that was uploaded (copy this list to Claude):"
+            Get-ChildItem -Recurse -Depth 3 | ForEach-Object { $_.FullName }
+            exit 1
+          }
+          $root = $req.DirectoryName
+          Write-Host "Project found at: $root"
+          "PROJECT_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install dependencies
+        working-directory: ${{ env.PROJECT_ROOT }}
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
+
       - name: Run tests
+        working-directory: ${{ env.PROJECT_ROOT }}
         run: |
           python dev/make_test_doc.py
           python dev/test_end_to_end.py
+
       - name: Build app
+        working-directory: ${{ env.PROJECT_ROOT }}
         run: pyinstaller CiteTool.spec --noconfirm
+
       - name: Package
+        working-directory: ${{ env.PROJECT_ROOT }}
         run: Compress-Archive -Path dist/CiteTool -DestinationPath CiteTool-windows.zip
+
       - uses: actions/upload-artifact@v4
         with:
           name: CiteTool-windows
-          path: CiteTool-windows.zip
+          path: ${{ env.PROJECT_ROOT }}/CiteTool-windows.zip
           retention-days: 30
