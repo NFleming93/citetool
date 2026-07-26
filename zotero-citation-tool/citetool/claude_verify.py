@@ -1,0 +1,192 @@
+"""The Claude verification layer (the core value-add).
+
+Whether or not a translator produced metadata, Claude sees the URL, the
+translator's attempt, and the distilled page content, and returns
+verified metadata + per-field uncertainty flags — or an honest
+"unresolvable". No guessing, no tools: the page was already fetched, so
+each verification is a single deterministic call.
+
+Auth (kept deliberately thin and isolated — billing arrangements may
+change again):
+  - "subscription" mode: the bundled Claude Code CLI's stored sign-in.
+    Verified against docs 2026-07-26: third-party Agent SDK apps using
+    subscription sign-in draw from the user's own plan limits.
+  - "api_key" mode: a console.anthropic.com key, pay-as-you-go fallback.
+An API key in the environment would silently shadow subscription auth,
+so subscription mode strips it from the subprocess environment.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+
+# A pragmatic subset of Zotero item types for web-cited material. The
+# schema validator is still the gatekeeper; this just steers Claude.
+ITEM_TYPES = ["webpage", "report", "document", "journalArticle", "book",
+              "bookSection", "newspaperArticle", "magazineArticle", "blogPost",
+              "conferencePaper", "presentation", "thesis", "dataset", "preprint",
+              "statute", "bill", "hearing", "encyclopediaArticle"]
+
+MODEL_CHOICES = [
+    ("haiku", "Haiku — fastest, lightest on your plan"),
+    ("sonnet", "Sonnet — recommended"),
+    ("opus", "Opus — most careful judgement"),
+]
+
+PROMPT_TEMPLATE = """You are verifying citation metadata for a reference manager (Zotero).
+
+URL cited in the document: {url}
+Anchor text the author used: {anchor}
+
+Translator's attempt at metadata (may be empty, wrong, or good):
+{raw}
+
+Distilled page content ({page_status}):
+TITLE TAG: {page_title}
+METADATA TAGS: {page_meta}
+VISIBLE TEXT (truncated): {page_text}
+
+Your job — verify or repair the metadata. Judgement calls that matter:
+- itemType: choose the best fit from {item_types}. Government and \
+institutional publications are usually "report" or "document", not "webpage".
+- Corporate/institutional authors are often only in page text or footers, \
+not metadata tags. Use the single-field creator form for them: \
+{{"creatorType":"author","name":"Australian Institute of Health and Welfare"}}. \
+Use {{"creatorType":"author","firstName":"…","lastName":"…"}} for people.
+- Publication dates are often buried in body text ("Published 14 March 2024", \
+"© 2023"). Prefer a real date over none; use the precision the page supports \
+("2024-03-14", "March 2024", or "2023").
+- Replace garbage titles ("Home | Department of Health") with the real \
+document title.
+- Useful fields when applicable: publisher, institution, reportNumber, \
+reportType, websiteTitle, publicationTitle, DOI, language.
+
+Honesty rules:
+- For any field you are not confident about, add a flag: \
+{{"field":"…","note":"short reason, e.g. 'author inferred from page footer'"}}.
+- If the page content is unavailable/paywalled/irrelevant AND the translator \
+gave nothing usable, set "resolvable": false with a short "reason". \
+NEVER invent metadata.
+
+Respond with ONLY this JSON, no markdown fences, no commentary:
+{{"resolvable": true|false, "reason": null|"…", \
+"item": {{"itemType":"…","title":"…","creators":[…],"date":"…","url":"{url}", …}}, \
+"flags": [{{"field":"…","note":"…"}}]}}"""
+
+
+@dataclass
+class VerifiedItem:
+    resolvable: bool
+    item: dict = field(default_factory=dict)
+    flags: list[dict] = field(default_factory=list)
+    reason: str | None = None
+    model_used: str = ""
+    raw_response: str = ""
+
+
+def build_prompt(url: str, anchor: str, raw: dict | None, page) -> str:
+    return PROMPT_TEMPLATE.format(
+        url=url, anchor=anchor,
+        raw=json.dumps(raw, ensure_ascii=False, indent=1) if raw else "(none — translators failed on this URL)",
+        page_status=("fetched OK" if page.ok else f"FETCH FAILED: {page.error}"),
+        page_title=page.title or "(none)",
+        page_meta=json.dumps(page.meta, ensure_ascii=False) if page.meta else "(none)",
+        page_text=page.text or "(none)",
+        item_types=", ".join(ITEM_TYPES),
+    )
+
+
+def parse_response(text: str, model: str) -> VerifiedItem:
+    cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not m:
+        raise ValueError("no JSON object in response")
+    data = json.loads(m.group(0))
+    return VerifiedItem(
+        resolvable=bool(data.get("resolvable")),
+        item=data.get("item") or {},
+        flags=[f for f in (data.get("flags") or []) if isinstance(f, dict)],
+        reason=data.get("reason"),
+        model_used=model,
+        raw_response=text,
+    )
+
+
+def _clean_env(auth_mode: str, api_key: str) -> dict:
+    env = dict(os.environ)
+    if auth_mode == "subscription":
+        env.pop("ANTHROPIC_API_KEY", None)   # would shadow the sign-in
+    else:
+        env["ANTHROPIC_API_KEY"] = api_key
+    return env
+
+
+class ClaudeVerifier:
+    """Real implementation over the Agent SDK. Imports lazily so the rest
+    of the app (and all tests) run without the SDK present."""
+
+    def __init__(self, model: str = "sonnet", auth_mode: str = "subscription",
+                 api_key: str = ""):
+        self.model = model
+        self.auth_mode = auth_mode
+        self.api_key = api_key
+
+    def _ask(self, prompt: str) -> str:
+        import anyio
+        from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, TextBlock
+
+        options = ClaudeAgentOptions(
+            model=self.model,
+            max_turns=1,
+            allowed_tools=[],          # page already fetched; pure judgement call
+            env=_clean_env(self.auth_mode, self.api_key),
+        )
+
+        async def run() -> str:
+            parts: list[str] = []
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            parts.append(block.text)
+            return "".join(parts)
+
+        return anyio.run(run)
+
+    def verify(self, url: str, anchor: str, raw: dict | None, page) -> VerifiedItem:
+        prompt = build_prompt(url, anchor, raw, page)
+        text = self._ask(prompt)
+        try:
+            return parse_response(text, self.model)
+        except (ValueError, json.JSONDecodeError):
+            retry = prompt + "\n\nYour previous reply was not valid bare JSON. Respond with ONLY the JSON object."
+            return parse_response(self._ask(retry), self.model)
+
+    def check_auth(self) -> tuple[bool, str]:
+        """A tiny call to confirm sign-in works. Returns (ok, detail)."""
+        try:
+            text = self._ask("Reply with exactly: OK")
+            return ("OK" in text, text.strip()[:200] or "empty reply")
+        except Exception as e:
+            return (False, f"{type(e).__name__}: {e}"[:300])
+
+
+def find_bundled_cli() -> str | None:
+    """Locate the Claude Code CLI executable that ships inside the
+    claude-agent-sdk package, so the wizard can launch the sign-in flow."""
+    try:
+        import claude_agent_sdk
+    except ImportError:
+        return None
+    import pathlib
+    pkg = pathlib.Path(claude_agent_sdk.__file__).parent
+    pattern = "claude.exe" if sys.platform == "win32" else "claude"
+    hits = [p for p in pkg.rglob(pattern) if p.is_file()]
+    if hits:
+        return str(hits[0])
+    import shutil
+    return shutil.which("claude")   # fall back to a system-wide install
