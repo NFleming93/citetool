@@ -123,7 +123,15 @@ def _clean_env(auth_mode: str, api_key: str) -> dict:
     # empty-string override is how you neutralise a stray API key that would
     # otherwise shadow the subscription sign-in.
     if auth_mode == "subscription":
-        return {"ANTHROPIC_API_KEY": ""}
+        overlay = {"ANTHROPIC_API_KEY": ""}
+        # The sign-in flow ("setup-token") PRINTS a long-lived code rather
+        # than storing one, so the wizard captures it into config and we
+        # hand it to every call here.
+        from . import config as _config
+        token = _config.load().get("claude_oauth_token", "")
+        if token:
+            overlay["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        return overlay
     return {"ANTHROPIC_API_KEY": api_key}
 
 
