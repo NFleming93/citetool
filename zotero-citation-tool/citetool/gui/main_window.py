@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QMessageBox, QHeaderView)
 
 from .. import config
-from ..claude_verify import ClaudeVerifier, MODEL_CHOICES
+from ..claude_verify import ClaudeVerifier, MODEL_CHOICES, PEDANTRY_CHOICES
 from ..pipeline import Pipeline, setup_logging, load_schema_cached
 from ..zotero_client import ZoteroClient
 from .review import ReviewDialog
@@ -58,6 +58,14 @@ class MainWindow(QMainWindow):
         idx = [a for a, _ in MODEL_CHOICES].index(cfg.get("model", "sonnet"))
         self.model_combo.setCurrentIndex(idx)
         top.addWidget(self.model_combo)
+        top.addWidget(QLabel("Checking style:"))
+        self.pedantry_combo = QComboBox()
+        for key, label, _ in PEDANTRY_CHOICES:
+            self.pedantry_combo.addItem(label, key)
+        pidx = [k for k, _, _ in PEDANTRY_CHOICES].index(
+            cfg.get("pedantry", "balanced"))
+        self.pedantry_combo.setCurrentIndex(pidx)
+        top.addWidget(self.pedantry_combo)
         lay.addLayout(top)
 
         self.file_label = QLabel("No document chosen yet. Your document is only "
@@ -70,6 +78,7 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(True)
         lay.addWidget(self.table, 1)
 
         btns = QHBoxLayout()
@@ -120,11 +129,13 @@ class MainWindow(QMainWindow):
     def _analyse(self):
         self.btn_run.setEnabled(False)
         self.cfg["model"] = self.model_combo.currentData()
+        self.cfg["pedantry"] = self.pedantry_combo.currentData()
         config.save(self.cfg)
         try:
             verifier = ClaudeVerifier(model=self.cfg["model"],
                                       auth_mode=self.cfg["claude_auth_mode"],
-                                      api_key=self.cfg.get("anthropic_api_key", ""))
+                                      api_key=self.cfg.get("anthropic_api_key", ""),
+                                      pedantry=self.cfg.get("pedantry", "balanced"))
             zotero = ZoteroClient(self.cfg["zotero_api_key"],
                                   self.cfg["zotero_user_id"])
             schema = load_schema_cached()
@@ -164,9 +175,14 @@ class MainWindow(QMainWindow):
             self.table.item(r, 2).setText(text)
             if detail:
                 self.table.item(r, 3).setText(detail)
+                self.table.item(r, 3).setToolTip(detail)
             if colour:
                 for c in range(self.table.columnCount()):
                     self.table.item(r, c).setBackground(colour)
+                    # pastel backgrounds need dark text regardless of the
+                    # system theme (white-on-amber in dark mode is unreadable)
+                    self.table.item(r, c).setForeground(QColor(32, 32, 32))
+            self.table.resizeRowToContents(r)
 
     def _on_metadata_done(self):
         self.btn_run.setEnabled(True)
