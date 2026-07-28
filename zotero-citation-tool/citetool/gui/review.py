@@ -153,6 +153,7 @@ class ReviewDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(True)
         self.table.doubleClicked.connect(self._edit_row)
         lay.addWidget(self.table)
         self._fill()
@@ -191,9 +192,11 @@ class ReviewDialog(QDialog):
             for c, v in enumerate(vals, start=1):
                 cell = QTableWidgetItem(v)
                 cell.setBackground(colour)
+                cell.setForeground(QColor(32, 32, 32))   # readable in dark mode
                 if c == 6:
                     cell.setToolTip(v)
                 self.table.setItem(r, c, cell)
+        self.table.resizeRowsToContents()
 
     def _edit_row(self, index):
         p = self._rows()[index.row()]
