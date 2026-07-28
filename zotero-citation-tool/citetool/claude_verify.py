@@ -38,6 +38,22 @@ MODEL_CHOICES = [
     ("opus", "Opus — most careful judgement"),
 ]
 
+PEDANTRY_CHOICES = [
+    ("strict", "Thorough — flag every uncertainty",
+     "Flag every field you are not fully confident about, however minor. "
+     "Err on the side of flagging; the reviewer wants to see your doubts."),
+    ("balanced", "Balanced — flag what's worth a look",
+     "Flag a field only when a careful author would genuinely want to "
+     "double-check it: inferred authorship, ambiguous or conflicting dates, "
+     "retitled documents, guessed publishers. Routine judgement calls you "
+     "are reasonably confident about need no flag."),
+    ("relaxed", "Relaxed — only real problems",
+     "Only flag genuine problems: contradictions, fields you had to guess, "
+     "or key information you could not determine. If title, author, and "
+     "date check out against the page, return an empty flags list — "
+     "verified is good enough."),
+]
+
 PROMPT_TEMPLATE = """You are verifying citation metadata for a reference manager (Zotero).
 
 URL cited in the document: {url}
@@ -67,8 +83,8 @@ document title.
 reportType, websiteTitle, publicationTitle, DOI, language.
 
 Honesty rules:
-- For any field you are not confident about, add a flag: \
-{{"field":"…","note":"short reason, e.g. 'author inferred from page footer'"}}.
+- Flagging policy for this run: {pedantry} \
+Flags look like: {{"field":"…","note":"short reason, e.g. 'author inferred from page footer'"}}.
 - If the page content is unavailable/paywalled/irrelevant AND the translator \
 gave nothing usable, set "resolvable": false with a short "reason". \
 NEVER invent metadata.
@@ -89,9 +105,11 @@ class VerifiedItem:
     raw_response: str = ""
 
 
-def build_prompt(url: str, anchor: str, raw: dict | None, page) -> str:
+def build_prompt(url: str, anchor: str, raw: dict | None, page,
+                 pedantry: str = "strict") -> str:
+    pedantry_text = next(t for k, _, t in PEDANTRY_CHOICES if k == pedantry)
     return PROMPT_TEMPLATE.format(
-        url=url, anchor=anchor,
+        url=url, anchor=anchor, pedantry=pedantry_text,
         raw=json.dumps(raw, ensure_ascii=False, indent=1) if raw else "(none — translators failed on this URL)",
         page_status=("fetched OK" if page.ok else f"FETCH FAILED: {page.error}"),
         page_title=page.title or "(none)",
@@ -140,10 +158,11 @@ class ClaudeVerifier:
     of the app (and all tests) run without the SDK present."""
 
     def __init__(self, model: str = "sonnet", auth_mode: str = "subscription",
-                 api_key: str = ""):
+                 api_key: str = "", pedantry: str = "strict"):
         self.model = model
         self.auth_mode = auth_mode
         self.api_key = api_key
+        self.pedantry = pedantry
 
     def _ask(self, prompt: str) -> str:
         import anyio
@@ -178,7 +197,7 @@ class ClaudeVerifier:
         return anyio.run(run)
 
     def verify(self, url: str, anchor: str, raw: dict | None, page) -> VerifiedItem:
-        prompt = build_prompt(url, anchor, raw, page)
+        prompt = build_prompt(url, anchor, raw, page, self.pedantry)
         text = self._ask(prompt)
         try:
             return parse_response(text, self.model)
